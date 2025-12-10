@@ -81,68 +81,90 @@ export const checkBalance = async (req: Request, res: Response) => {
     }
 };
 
+import { TSSSession } from '../utils/mpc/tssSession';
+import { ShareStore } from '../store';
+import { computeAddress, keccak256, Transaction as EthTransaction } from 'ethers';
+
 export const sendTransaction = async (req: Request, res: Response) => {
     try {
         const { shares, sender, to, value } = req.body;
 
-        // Validation
-        if (!shares || !Array.isArray(shares) || shares.length < 2) {
-            return res.status(400).json({ success: false, error: 'At least 2 shares are required' });
-        }
-        if (!sender || !ethers.isAddress(sender)) {
-            return res.status(400).json({ success: false, error: 'Valid sender address is required' });
-        }
-        if (!to || !ethers.isAddress(to)) {
-            return res.status(400).json({ success: false, error: 'Valid receiver address is required' });
-        }
-        if (!value || isNaN(Number(value))) {
-            return res.status(400).json({ success: false, error: 'Valid amount is required' });
+        if (!shares || !Array.isArray(shares) || shares.length < 1) {
+            return res.status(400).json({ success: false, error: 'User share (A or C) is required' });
         }
 
-        // 1. Reconstruct Private Key
-        const privateKey = reconstructKey(shares);
+        // 1. Get Client Share
+        let clientShareData;
+        try {
+            const shareRaw = shares[0];
+            // It might be a JSON string or an object depending on how frontend sends it
+            // Frontend sends stringify value in 'shares' array
+            clientShareData = typeof shareRaw === 'string' ? JSON.parse(shareRaw) : shareRaw;
+        } catch (e) {
+            return res.status(400).json({ success: false, error: 'Invalid share format. Must be JSON.' });
+        }
 
-        // 2. Connect to Provider
-        const provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+        if (!clientShareData.share || !clientShareData.index) {
+            return res.status(400).json({ success: false, error: 'Invalid share content. Missing share or index.' });
+        }
 
-        // 3. Create Wallet Instance
-        const wallet = new ethers.Wallet(privateKey, provider);
-
-        // 4. Verify Sender
-        if (wallet.address.toLowerCase() !== sender.toLowerCase()) {
+        // 2. Retrieve Server Share (B)
+        const serverShareHex = await ShareStore.getShare(sender);
+        if (!serverShareHex) {
             return res.status(400).json({
                 success: false,
-                error: 'Invalid Shares: Reconstructed wallet address does not match sender address.'
+                error: 'Server share not found for this address.'
             });
         }
 
-        // Debug Logs
-        const balance = await provider.getBalance(wallet.address);
-        console.log(`[TX] Sender: ${wallet.address}`);
-        console.log(`[TX] Balance: ${ethers.formatEther(balance)} ETH`);
+        // 3. Prepare Transaction to Sign
+        const provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+        const feeData = await provider.getFeeData();
+        const nonce = await provider.getTransactionCount(sender, 'pending');
 
-        // 5. Get Nonce (including pending)
-        const nonce = await provider.getTransactionCount(wallet.address, 'pending');
-        console.log(`[TX] Nonce: ${nonce}`);
-
-        // 6. Send Transaction
-        console.log('[TX] Sending transaction...');
-        const tx = await wallet.sendTransaction({
+        const tx = EthTransaction.from({
             to,
             value: ethers.parseEther(String(value)),
-            nonce
+            nonce,
+            gasLimit: 21000,
+            gasPrice: feeData.gasPrice,
+            chainId: 11155111 // Sepolia
         });
-        console.log(`[TX] Sent! Hash: ${tx.hash}`);
 
-        // 7. Respond with Hash
+        const unsignedTxHash = tx.unsignedHash;
+
+        // 4. Perform TSS Signing (Lagrange Interpolation)
+        // Combine Client Share (A or C) + Server Share (B)
+        console.log(`[TSS] Signing with Index ${clientShareData.index} (Client) and Index 2 (Server)`);
+
+        const signature = TSSSession.sign(
+            unsignedTxHash,
+            serverShareHex,
+            clientShareData.share,
+            clientShareData.index
+        );
+
+        // 5. Attach Signature
+        tx.signature = {
+            r: signature.r,
+            s: signature.s,
+            v: signature.v
+        };
+
+        // 6. Broadcast
+        console.log('[TSS] Broadcasting signed transaction...');
+        const serializedTx = tx.serialized;
+        const broadcastResponse = await provider.broadcastTransaction(serializedTx);
+        console.log(`[TSS] Transaction Sent! Hash: ${broadcastResponse.hash}`);
+
         res.json({
             success: true,
-            txHash: tx.hash,
-            explorerUrl: `https://sepolia.etherscan.io/tx/${tx.hash}`
+            txHash: broadcastResponse.hash,
+            explorerUrl: `https://sepolia.etherscan.io/tx/${broadcastResponse.hash}`
         });
 
     } catch (error: any) {
-        console.error('[TX] Error:', error);
+        console.error('[TSS] Transaction Error:', error);
         res.status(500).json({
             success: false,
             error: error.message || 'Failed to send transaction'

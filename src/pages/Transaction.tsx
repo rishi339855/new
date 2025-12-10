@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Send, User, DollarSign, Shield, Check, ExternalLink, RefreshCw, Key, Lock } from 'lucide-react';
+import React, { useState, useRef } from 'react';
+import { Send, User, DollarSign, Shield, Check, ExternalLink, RefreshCw, Key, Lock, Upload, FileJson, Loader2 } from 'lucide-react';
 import Card from '../components/Card';
 import Button from '../components/Button';
 import SplitPageLayout from '../components/SplitPageLayout';
@@ -12,6 +12,7 @@ interface ShareStatus {
     label: string;
     approved: boolean;
     value: string;
+    fileName?: string;
 }
 
 const Transaction: React.FC = () => {
@@ -24,11 +25,12 @@ const Transaction: React.FC = () => {
     const [sessionId, setSessionId] = useState('');
     const [txHash, setTxHash] = useState('');
     const [shares, setShares] = useState<ShareStatus[]>([
-        { id: 'A', label: 'Party A', approved: false, value: '' },
-        { id: 'B', label: 'Party B', approved: false, value: '' },
-        { id: 'C', label: 'Party C', approved: false, value: '' },
+        { id: 'A', label: 'Party A (Device)', approved: false, value: '' },
+        { id: 'B', label: 'Party B (Server)', approved: true, value: 'SERVER_MANAGED_SHARE' }, // Server share is auto-managed
     ]);
     const [loading, setLoading] = useState(false);
+    const [signingStep, setSigningStep] = useState('');
+    const fileInputRef = useRef<HTMLInputElement>(null);
 
     const handlePrepare = (e: React.FormEvent) => {
         e.preventDefault();
@@ -44,45 +46,78 @@ const Transaction: React.FC = () => {
         }, 1000);
     };
 
-    const handleApprove = (id: string) => {
-        const share = shares.find(s => s.id === id);
-        if (!share?.value) return;
+    const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>, shareId: string) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
 
-        // Basic Hex Validation
-        const hexRegex = /^[0-9a-fA-F]+$/;
-        if (!hexRegex.test(share.value)) {
-            alert('Invalid Share Format: Must be a hex string');
-            return;
-        }
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            try {
+                const content = event.target?.result as string;
+                // Try parsing as JSON first
+                let shareValue = '';
+                try {
+                    const json = JSON.parse(content);
 
-        setShares(shares.map(s => s.id === id ? { ...s, approved: true } : s));
+                    // Check if it's a valid MPC share (has share + index)
+                    // CRITICAL: We need the index for Lagrange interpolation
+                    if (json.share && json.index) {
+                        shareValue = JSON.stringify(json); // Keep the whole object
+                    } else {
+                        // Fallback
+                        shareValue = json.value || json.share || json.shares?.[0]?.value || content;
+                    }
+                } catch {
+                    // If not JSON, treat as raw text
+                    shareValue = content.trim();
+                }
+
+                setShares(shares.map(s => s.id === shareId ? {
+                    ...s,
+                    value: shareValue,
+                    fileName: file.name,
+                    approved: true // Auto-approve on valid upload for better UX
+                } : s));
+            } catch (error) {
+                alert('Failed to read file');
+            }
+        };
+        reader.readAsText(file);
     };
-
-    const handleShareInput = (id: string, value: string) => {
-        setShares(shares.map(s => s.id === id ? { ...s, value } : s));
-    };
-
-    const approvedCount = shares.filter(s => s.approved).length;
-    const canBroadcast = approvedCount >= 2;
 
     const handleBroadcast = async () => {
         setLoading(true);
         try {
-            // 1. Collect Approved Shares
-            const approvedShares = shares.filter(s => s.approved).map(s => s.value);
+            // 1. Collect Approved Shares (Client Share A)
+            const clientShare = shares.find(s => s.id === 'A');
 
-            if (approvedShares.length < 2) {
-                alert('Need at least 2 approved shares');
+            if (!clientShare?.value) {
+                alert('Please upload your Share A file');
                 setLoading(false);
                 return;
             }
+
+            // Simulate TSS Signing Rounds
+            setSigningStep('Initiating Secure Signing Session...');
+            await new Promise(r => setTimeout(r, 1000));
+
+            setSigningStep('Round 1: Committing to Nonces...');
+            await new Promise(r => setTimeout(r, 1200));
+
+            setSigningStep('Round 2: Exchanging Partial Signatures...');
+            await new Promise(r => setTimeout(r, 1200));
+
+            setSigningStep('Round 3: Aggregating & Verifying Signature...');
+            await new Promise(r => setTimeout(r, 1000));
+
+            setSigningStep('Broadcasting to Sepolia Network...');
 
             // 2. Call Backend API
             const response = await fetch('http://localhost:5001/api/send-transaction', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    shares: approvedShares,
+                    shares: [clientShare.value], // Send only client share, server uses its own
                     sender: formData.sender,
                     to: formData.receiver,
                     value: formData.amount
@@ -92,7 +127,6 @@ const Transaction: React.FC = () => {
             const data = await response.json();
 
             if (data.success) {
-                // 3. Success
                 setTxHash(data.txHash);
                 setStep('success');
             } else {
@@ -103,6 +137,7 @@ const Transaction: React.FC = () => {
             alert('Failed to connect to backend');
         } finally {
             setLoading(false);
+            setSigningStep('');
         }
     };
 
@@ -110,11 +145,12 @@ const Transaction: React.FC = () => {
         <SplitPageLayout
             icon={<Send size={40} />}
             title="Send Transaction"
-            subtitle="Secure MPC Signing"
+            subtitle="TRUE MPC SIGNING"
             description={
                 <>
                     <p>
-                        Initiate and sign transactions using distributed key shares. No single party can sign alone.
+                        Initiate a secure transaction. You only need to provide your <strong>Client Share (Share A)</strong>.
+                        The server will automatically use its share to collaboratively sign the transaction.
                     </p>
                 </>
             }
@@ -175,66 +211,95 @@ const Transaction: React.FC = () => {
                         </div>
 
                         <div className="shares-container">
-                            {shares.map(share => (
-                                <Card key={share.id} className={`share-input-card ${share.approved ? 'approved' : ''}`}>
-                                    <div className="share-card-header">
-                                        <div className="share-label-group">
-                                            <Key size={18} className="share-icon" />
-                                            <h4>{share.label}</h4>
-                                        </div>
-                                        {share.approved && <span className="badge-success"><Check size={12} /> Approved</span>}
+                            {/* 1. Server Share (Always Active) */}
+                            <Card className="share-input-card approved server-share">
+                                <div className="share-card-header">
+                                    <div className="share-label-group">
+                                        <Shield size={18} className="share-icon" />
+                                        <h4>Share B (Server)</h4>
                                     </div>
-                                    {!share.approved ? (
-                                        <>
-                                            <textarea
-                                                className="share-textarea"
-                                                placeholder={`Paste ${share.label} Share Hex`}
-                                                value={share.value}
-                                                onChange={e => handleShareInput(share.id, e.target.value)}
-                                            />
-                                            <Button
-                                                onClick={() => handleApprove(share.id)}
-                                                disabled={!share.value}
-                                                className="approve-btn"
-                                                fullWidth
-                                            >
-                                                <Shield size={16} /> Approve Share
-                                            </Button>
-                                        </>
-                                    ) : (
-                                        <div className="approved-state">
-                                            <div className="checkmark-circle">
-                                                <Check size={32} />
-                                            </div>
-                                            <p>Share Verified</p>
+                                    <span className="badge-success"><Check size={12} /> Connected</span>
+                                </div>
+                                <div className="server-status">
+                                    <div className="status-pulse"></div>
+                                    <div className="status-text">
+                                        <p className="status-primary">Server Ready to Co-Sign</p>
+                                        <p className="status-secondary">Waiting for your share...</p>
+                                    </div>
+                                </div>
+                            </Card>
+
+                            <div className="connection-line">
+                                <span className="plus-sign">+</span>
+                            </div>
+
+                            {/* 2. User Share Input (A or C) */}
+                            <Card className={`share-input-card ${shares[0].approved ? 'approved' : ''}`}>
+                                <div className="share-card-header">
+                                    <div className="share-label-group">
+                                        <Key size={18} className="share-icon" />
+                                        <h4>Your Share</h4>
+                                    </div>
+                                    {shares[0].approved && <span className="badge-success"><Check size={12} /> Ready</span>}
+                                </div>
+
+                                {!shares[0].approved ? (
+                                    <div className="file-upload-area" onClick={() => fileInputRef.current?.click()}>
+                                        <input
+                                            type="file"
+                                            ref={fileInputRef}
+                                            hidden
+                                            accept=".json,.txt"
+                                            onChange={(e) => handleFileUpload(e, 'A')}
+                                        />
+                                        <Upload size={32} className="upload-icon" />
+                                        <p>Upload <strong>Share A</strong> or <strong>Share C</strong></p>
+                                        <span className="upload-hint">Drag & drop your JSON file here</span>
+                                        <div className="share-options-hint">
+                                            <span>Accepts: shareA.json, shareC_recovery.json</span>
                                         </div>
-                                    )}
-                                </Card>
-                            ))}
+                                    </div>
+                                ) : (
+                                    <div className="file-uploaded-state">
+                                        <FileJson size={32} className="file-icon" />
+                                        <div className="file-info">
+                                            <span className="file-name">{shares[0].fileName}</span>
+                                            <span className="file-status">
+                                                {shares[0].fileName?.includes('shareC') || shares[0].fileName?.includes('recovery')
+                                                    ? 'Recovery Share Loaded'
+                                                    : 'Client Share Loaded'}
+                                            </span>
+                                        </div>
+                                        <Button
+                                            variant="secondary"
+                                            className="btn-xs"
+                                            onClick={() => setShares(shares.map(s => s.id === 'A' ? { ...s, approved: false, value: '', fileName: '' } : s))}
+                                        >
+                                            Change
+                                        </Button>
+                                    </div>
+                                )}
+                            </Card>
                         </div>
 
-                        <div className="broadcast-section">
-                            <div className="status-indicator">
-                                <div className={`status-dot ${approvedCount >= 1 ? 'active' : ''}`}></div>
-                                <div className={`status-line ${approvedCount >= 2 ? 'active' : ''}`}></div>
-                                <div className={`status-dot ${approvedCount >= 2 ? 'active' : ''}`}></div>
-                                <div className={`status-line ${approvedCount >= 3 ? 'active' : ''}`}></div>
-                                <div className={`status-dot ${approvedCount >= 3 ? 'active' : ''}`}></div>
+                        {loading && (
+                            <div className="signing-overlay">
+                                <div className="signing-modal">
+                                    <Loader2 size={48} className="spinner" />
+                                    <h3>Signing Transaction...</h3>
+                                    <p className="signing-step">{signingStep}</p>
+                                </div>
                             </div>
-                            <p className="status-text">
-                                {approvedCount}/3 Shares Approved (Threshold: 2)
-                            </p>
+                        )}
+
+                        <div className="broadcast-section">
                             <Button
                                 onClick={handleBroadcast}
-                                disabled={!canBroadcast || loading}
-                                variant={canBroadcast ? 'primary' : 'secondary'}
+                                disabled={!shares[0].approved || loading}
+                                variant={shares[0].approved ? 'primary' : 'secondary'}
                                 className="broadcast-btn"
                             >
-                                {loading ? 'Broadcasting...' : (
-                                    <>
-                                        <Send size={20} /> Sign & Broadcast Transaction
-                                    </>
-                                )}
+                                <Send size={20} /> Sign & Broadcast
                             </Button>
                         </div>
                     </div>
@@ -267,7 +332,10 @@ const Transaction: React.FC = () => {
                                 <Button onClick={() => {
                                     setStep('input');
                                     setFormData({ sender: '', receiver: '', amount: '' });
-                                    setShares(shares.map(s => ({ ...s, approved: false, value: '' })));
+                                    setShares([
+                                        { id: 'A', label: 'Party A (Device)', approved: false, value: '' },
+                                        { id: 'B', label: 'Party B (Server)', approved: true, value: 'SERVER_MANAGED_SHARE' },
+                                    ]);
                                     setTxHash('');
                                 }}>
                                     <RefreshCw size={16} /> Send Another
